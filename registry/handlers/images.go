@@ -10,6 +10,7 @@ import (
 	ctxu "github.com/docker/distribution/context"
 	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest/manifestlist"
+	"github.com/docker/distribution/manifest/ocischema"
 	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
 	"github.com/docker/distribution/reference"
@@ -17,6 +18,7 @@ import (
 	"github.com/docker/distribution/registry/api/v2"
 	"github.com/docker/distribution/registry/auth"
 	"github.com/gorilla/handlers"
+	"github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // These constants determine which architecture and OS to choose from a
@@ -25,6 +27,18 @@ const (
 	defaultArch         = "amd64"
 	defaultOS           = "linux"
 	maxManifestBodySize = 4 << 20
+	imageClass          = "image"
+)
+
+type storageType int
+
+const (
+	manifestSchema1     storageType = iota // 0
+	manifestSchema2                        // 1
+	manifestlistSchema                     // 2
+	ociSchema                              // 3
+	ociImageIndexSchema                    // 4
+	numStorageTypes                        // 5
 )
 
 // imageManifestDispatcher takes the request context and builds the
@@ -72,8 +86,40 @@ func (imh *imageManifestHandler) GetImageManifest(w http.ResponseWriter, r *http
 		imh.Errors = append(imh.Errors, err)
 		return
 	}
+	var supports [numStorageTypes]bool
 
-	var manifest distribution.Manifest
+	// this parsing of Accept headers is not quite as full-featured as godoc.org's parser, but we don't care about "q=" values
+	// https://github.com/golang/gddo/blob/e91d4165076d7474d20abda83f92d15c7ebc3e81/httputil/header/header.go#L165-L202
+	for _, acceptHeader := range r.Header["Accept"] {
+		// r.Header[...] is a slice in case the request contains the same header more than once
+		// if the header isn't set, we'll get the zero value, which "range" will handle gracefully
+
+		// we need to split each header value on "," to get the full list of "Accept" values (per RFC 2616)
+		// https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.1
+		for _, mediaType := range strings.Split(acceptHeader, ",") {
+			// remove "; q=..." if present
+			if i := strings.Index(mediaType, ";"); i >= 0 {
+				mediaType = mediaType[:i]
+			}
+
+			// it's common (but not required) for Accept values to be space separated ("a/b, c/d, e/f")
+			mediaType = strings.TrimSpace(mediaType)
+
+			if mediaType == schema2.MediaTypeManifest {
+				supports[manifestSchema2] = true
+			}
+			if mediaType == manifestlist.MediaTypeManifestList {
+				supports[manifestlistSchema] = true
+			}
+			if mediaType == v1.MediaTypeImageManifest {
+				supports[ociSchema] = true
+			}
+			if mediaType == v1.MediaTypeImageIndex {
+				supports[ociImageIndexSchema] = true
+			}
+		}
+	}
+
 	if imh.Tag != "" {
 		tags := imh.Repository.Tags(imh)
 		desc, err := tags.Get(imh, imh.Tag)
@@ -93,47 +139,39 @@ func (imh *imageManifestHandler) GetImageManifest(w http.ResponseWriter, r *http
 	if imh.Tag != "" {
 		options = append(options, distribution.WithTag(imh.Tag))
 	}
-	manifest, err = manifests.Get(imh, imh.Digest, options...)
+	manifest, err := manifests.Get(imh, imh.Digest, options...)
 	if err != nil {
 		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
 		return
 	}
-
-	supportsSchema2 := false
-	supportsManifestList := false
-	// this parsing of Accept headers is not quite as full-featured as godoc.org's parser, but we don't care about "q=" values
-	// https://github.com/golang/gddo/blob/e91d4165076d7474d20abda83f92d15c7ebc3e81/httputil/header/header.go#L165-L202
-	for _, acceptHeader := range r.Header["Accept"] {
-		// r.Header[...] is a slice in case the request contains the same header more than once
-		// if the header isn't set, we'll get the zero value, which "range" will handle gracefully
-
-		// we need to split each header value on "," to get the full list of "Accept" values (per RFC 2616)
-		// https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.1
-		for _, mediaType := range strings.Split(acceptHeader, ",") {
-			// remove "; q=..." if present
-			if i := strings.Index(mediaType, ";"); i >= 0 {
-				mediaType = mediaType[:i]
-			}
-
-			// it's common (but not required) for Accept values to be space separated ("a/b, c/d, e/f")
-			mediaType = strings.TrimSpace(mediaType)
-
-			if mediaType == schema2.MediaTypeManifest {
-				supportsSchema2 = true
-			}
-			if mediaType == manifestlist.MediaTypeManifestList {
-				supportsManifestList = true
-			}
+	// determine the type of the returned manifest
+	manifestType := manifestSchema1
+	schema2Manifest, isSchema2 := manifest.(*schema2.DeserializedManifest)
+	manifestList, isManifestList := manifest.(*manifestlist.DeserializedManifestList)
+	if isSchema2 {
+		manifestType = manifestSchema2
+	} else if _, isOCImanifest := manifest.(*ocischema.DeserializedManifest); isOCImanifest {
+		manifestType = ociSchema
+	} else if isManifestList {
+		if manifestList.MediaType == manifestlist.MediaTypeManifestList {
+			manifestType = manifestlistSchema
+		} else if manifestList.MediaType == v1.MediaTypeImageIndex {
+			manifestType = ociImageIndexSchema
 		}
 	}
 
-	schema2Manifest, isSchema2 := manifest.(*schema2.DeserializedManifest)
-	manifestList, isManifestList := manifest.(*manifestlist.DeserializedManifestList)
-
+	if manifestType == ociSchema && !supports[ociSchema] {
+		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
+		return
+	}
+	if manifestType == ociImageIndexSchema && !supports[ociImageIndexSchema] {
+		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithMessage("OCI index found, but accept header does not support OCI indexes"))
+		return
+	}
 	// Only rewrite schema2 manifests when they are being fetched by tag.
 	// If they are being fetched by digest, we can't return something not
 	// matching the digest.
-	if imh.Tag != "" && isSchema2 && !supportsSchema2 {
+	if imh.Tag != "" && manifestType == manifestSchema2 && !supports[manifestSchema2] {
 		// Rewrite manifest in schema1 format
 		ctxu.GetLogger(imh).Infof("rewriting manifest %s in schema1 format to support old client", imh.Digest.String())
 
@@ -141,7 +179,7 @@ func (imh *imageManifestHandler) GetImageManifest(w http.ResponseWriter, r *http
 		if err != nil {
 			return
 		}
-	} else if imh.Tag != "" && isManifestList && !supportsManifestList {
+	} else if imh.Tag != "" && manifestType == manifestlistSchema && !supports[manifestlistSchema] {
 		// Rewrite manifest in schema1 format
 		ctxu.GetLogger(imh).Infof("rewriting manifest list %s in schema1 format to support old client", imh.Digest.String())
 
@@ -167,7 +205,7 @@ func (imh *imageManifestHandler) GetImageManifest(w http.ResponseWriter, r *http
 		}
 
 		// If necessary, convert the image manifest
-		if schema2Manifest, isSchema2 := manifest.(*schema2.DeserializedManifest); isSchema2 && !supportsSchema2 {
+		if schema2Manifest, isSchema2 := manifest.(*schema2.DeserializedManifest); isSchema2 && !supports[manifestSchema2] {
 			manifest, err = imh.convertSchema2Manifest(schema2Manifest)
 			if err != nil {
 				return
@@ -268,6 +306,14 @@ func (imh *imageManifestHandler) PutImageManifest(w http.ResponseWriter, r *http
 		return
 	}
 
+	isAnOCIManifest := mediaType == v1.MediaTypeImageManifest || mediaType == v1.MediaTypeImageIndex
+
+	if isAnOCIManifest {
+		ctxu.GetLogger(imh).Debug("Putting an OCI Manifest!")
+	} else {
+		ctxu.GetLogger(imh).Debug("Putting a Docker Manifest!")
+	}
+
 	var options []distribution.ManifestServiceOption
 	if imh.Tag != "" {
 		options = append(options, distribution.WithTag(imh.Tag))
@@ -313,7 +359,6 @@ func (imh *imageManifestHandler) PutImageManifest(w http.ResponseWriter, r *http
 		default:
 			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		}
-
 		return
 	}
 
@@ -346,6 +391,8 @@ func (imh *imageManifestHandler) PutImageManifest(w http.ResponseWriter, r *http
 	w.Header().Set("Location", location)
 	w.Header().Set("Docker-Content-Digest", imh.Digest.String())
 	w.WriteHeader(http.StatusCreated)
+
+	ctxu.GetLogger(imh).Debug("Succeeded in putting manifest!")
 }
 
 // applyResourcePolicy checks whether the resource class matches what has
@@ -359,16 +406,22 @@ func (imh *imageManifestHandler) applyResourcePolicy(manifest distribution.Manif
 	var class string
 	switch m := manifest.(type) {
 	case *schema1.SignedManifest:
-		class = "image"
+		class = imageClass
 	case *schema2.DeserializedManifest:
 		switch m.Config.MediaType {
 		case schema2.MediaTypeConfig:
-			class = "image"
+			class = imageClass
 		case schema2.MediaTypePluginConfig:
 			class = "plugin"
 		default:
-			message := fmt.Sprintf("unknown manifest class for %s", m.Config.MediaType)
-			return errcode.ErrorCodeDenied.WithMessage(message)
+			return errcode.ErrorCodeDenied.WithMessage("unknown manifest class for " + m.Config.MediaType)
+		}
+	case *ocischema.DeserializedManifest:
+		switch m.Config.MediaType {
+		case v1.MediaTypeImageConfig:
+			class = imageClass
+		default:
+			return errcode.ErrorCodeDenied.WithMessage("unknown manifest class for " + m.Config.MediaType)
 		}
 	}
 
@@ -385,8 +438,7 @@ func (imh *imageManifestHandler) applyResourcePolicy(manifest distribution.Manif
 		}
 	}
 	if !allowedClass {
-		message := fmt.Sprintf("registry does not allow %s manifest", class)
-		return errcode.ErrorCodeDenied.WithMessage(message)
+		return errcode.ErrorCodeDenied.WithMessage(fmt.Sprintf("registry does not allow %s manifest", class))
 	}
 
 	resources := auth.AuthorizedResources(imh)
@@ -396,7 +448,7 @@ func (imh *imageManifestHandler) applyResourcePolicy(manifest distribution.Manif
 	for _, r := range resources {
 		if r.Name == n {
 			if r.Class == "" {
-				r.Class = "image"
+				r.Class = imageClass
 			}
 			if r.Class == class {
 				return nil
@@ -407,8 +459,7 @@ func (imh *imageManifestHandler) applyResourcePolicy(manifest distribution.Manif
 
 	// resource was found but no matching class was found
 	if foundResource {
-		message := fmt.Sprintf("repository not authorized for %s manifest", class)
-		return errcode.ErrorCodeDenied.WithMessage(message)
+		return errcode.ErrorCodeDenied.WithMessage(fmt.Sprintf("repository not authorized for %s manifest", class))
 	}
 
 	return nil

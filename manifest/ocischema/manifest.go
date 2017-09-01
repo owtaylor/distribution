@@ -1,4 +1,4 @@
-package schema2
+package ocischema
 
 import (
 	"encoding/json"
@@ -8,38 +8,20 @@ import (
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest"
-)
-
-const (
-	// MediaTypeManifest specifies the mediaType for the current version.
-	MediaTypeManifest = "application/vnd.docker.distribution.manifest.v2+json"
-
-	// MediaTypeConfig specifies the mediaType for the image configuration.
-	MediaTypeConfig = "application/vnd.docker.container.image.v1+json"
-
-	// MediaTypePluginConfig specifies the mediaType for plugin configuration.
-	MediaTypePluginConfig = "application/vnd.docker.plugin.v1+json"
-
-	// MediaTypeLayer is the mediaType used for layers referenced by the
-	// manifest.
-	MediaTypeLayer = "application/vnd.docker.image.rootfs.diff.tar.gzip"
-
-	// MediaTypeForeignLayer is the mediaType used for layers that must be
-	// downloaded from foreign URLs.
-	MediaTypeForeignLayer = "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"
+	"github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 var (
 	// SchemaVersion provides a pre-initialized version structure for this
 	// packages version of the manifest.
 	SchemaVersion = manifest.Versioned{
-		SchemaVersion: 2,
-		MediaType:     MediaTypeManifest,
+		SchemaVersion: 2, // historical value here.. does not pertain to OCI or docker version
+		MediaType:     v1.MediaTypeImageManifest,
 	}
 )
 
 func init() {
-	schema2Func := func(b []byte) (distribution.Manifest, distribution.Descriptor, error) {
+	ocischemaFunc := func(b []byte) (distribution.Manifest, distribution.Descriptor, error) {
 		m := new(DeserializedManifest)
 		err := m.UnmarshalJSON(b)
 		if err != nil {
@@ -47,15 +29,15 @@ func init() {
 		}
 
 		dgst := digest.FromBytes(b)
-		return m, distribution.Descriptor{Digest: dgst, Size: int64(len(b)), MediaType: MediaTypeManifest}, err
+		return m, distribution.Descriptor{Digest: dgst, Size: int64(len(b)), MediaType: v1.MediaTypeImageManifest}, err
 	}
-	err := distribution.RegisterManifestSchema(MediaTypeManifest, schema2Func)
+	err := distribution.RegisterManifestSchema(v1.MediaTypeImageManifest, ocischemaFunc)
 	if err != nil {
 		panic(fmt.Sprintf("Unable to register manifest: %s", err))
 	}
 }
 
-// Manifest defines a schema2 manifest.
+// Manifest defines a ocischema manifest.
 type Manifest struct {
 	manifest.Versioned
 
@@ -65,6 +47,9 @@ type Manifest struct {
 	// Layers lists descriptors for the layers referenced by the
 	// configuration.
 	Layers []distribution.Descriptor `json:"layers"`
+
+	// Annotations contains arbitrary metadata for the image manifest.
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // References returnes the descriptors of this manifests references.
