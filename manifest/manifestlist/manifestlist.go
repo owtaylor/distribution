@@ -45,6 +45,10 @@ func init() {
 	if err != nil {
 		panic(fmt.Sprintf("Unable to register manifest: %s", err))
 	}
+	err = distribution.RegisterManifestSchema(v1.MediaTypeImageIndex, manifestListFunc)
+	if err != nil {
+		panic(fmt.Sprintf("Unable to register manifest: %s", err))
+	}
 }
 
 // PlatformSpec specifies a platform where a particular image manifest is
